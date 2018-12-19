@@ -1,0 +1,5 @@
+*.so
+*.o
+*.bak
+redis
+RedisModulesSDK

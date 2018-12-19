@@ -1,0 +1,18 @@
+1. Multithreading
+     - Idea is to open 2-16 threads depending on core count and then pass a
+       mutex between them. They will share the element pointer, counter pointer,
+       and any other IO stuff. Those will only be accessed in the mutex. Also,
+       we should be doing the unlocking/relocking in that mutex so that the
+       all the threads stall while we let other things run. Maybe we should have
+       two mutexes, 1 for reads and one for writes, since I think they can
+       happen at the same time.
+2. Pagination
+     - We should do pagination redis side so as to avoid doing extra work. Maybe
+       doing it with threads would be neat (e.g. a thread every 2xpagesize entries)
+3. Memory management
+     - We are almost certainly not deallocating memory as we should be. Let's
+       fix that.
+
+BUGS
+  - When `count` gets passed into the main thread, it changes from -1 to some
+    fixed value.

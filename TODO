@@ -14,5 +14,4 @@
        fix that.
 
 BUGS
-  - When `count` gets passed into the main thread, it changes from -1 to some
-    fixed value.
+  - So far so none

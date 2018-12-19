@@ -74,7 +74,7 @@ struct ZHRegexCtx {
   RedisModuleString *hash_key;
   const char *prefix;
   const char *constraint;
-  long long *count;
+  long long count;
 };
 
 /*
@@ -124,7 +124,7 @@ void *ZHRegex_ThreadMain(void *arg) {
     const int regex_match = targ->regex_match;
     const int inverted = targ->invert;
     const pcre *regex = targ->regex;
-    long long count = *targ->count;
+    long long count = targ->count;
     RedisModuleString *hash_key = RedisModule_CreateStringFromString(ctx, targ->hash_key);
     RedisModuleString *source_set = targ->source_set;
     RedisModuleString *target_set = targ->target_set;
@@ -403,9 +403,8 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     pthread_t tid;
     RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx,ZHRegex_Reply,ZHRegex_Timeout,ZHRegex_FreeData,0);
 
-    long long *count_ptr = RedisModule_Alloc(sizeof(long long));
-    *count_ptr = count;
-    struct ZHRegexCtx rarg = {
+    struct ZHRegexCtx *targ = RedisModule_Alloc(sizeof(struct ZHRegexCtx));
+    struct ZHRegexCtx rarg = (struct ZHRegexCtx) {
       .ctx = RedisModule_GetThreadSafeContext(bc),
       .bc = bc,
       .source_set = source_set,
@@ -416,9 +415,9 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
       .constraint = constraint,
       .regex = regex,
       .hash_key = hash_key,
-      .count = count_ptr
+      .count = count
     };
-    struct ZHRegexCtx *targ = &rarg;
+    memcpy(targ, &rarg, sizeof(struct ZHRegexCtx));
 
     // void RedisModule_SetDisconnectCallback(RedisModuleBlockedClient *bc, RedisModuleDisconnectFunc callback);
 

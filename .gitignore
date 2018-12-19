@@ -3,3 +3,5 @@
 *.bak
 redis
 RedisModulesSDK
+*.aof
+*.rdb

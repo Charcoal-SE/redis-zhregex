@@ -90,6 +90,7 @@ struct ZHRegexReply {
 int ZHRegex_Reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
     REDISMODULE_NOT_USED(argc);
+    printf("Replying\n");
     struct ZHRegexReply *reply = RedisModule_GetBlockedClientPrivateData(ctx);
     if (reply->type == 1) {
       return RedisModule_ReplyWithError(ctx,reply->string_val);
@@ -112,6 +113,111 @@ void ZHRegex_FreeData(RedisModuleCtx *ctx, void *privdata) {
     // I shouldn't not free stuff... but eh, redis's automagical stuff should get it.
 }
 
+void ZHRegex_DisconnectCallback(RedisModuleCtx *ctx, RedisModuleBlockedClient *bc) {
+  printf("Disconnected :(\n");
+}
+
+struct LoopThreadRes {
+  int status;
+  struct ZHRegexReply reply;
+};
+
+struct LoopThreadRes ZHRegex_LoopThread(RedisModuleCtx *ctx, RedisModuleKey *source_key, RedisModuleKey *target_key, struct ZHRegexCtx *zhregex_ctx, long long *counter, long long *index) {
+  const int count = zhregex_ctx->count;
+  const RedisModuleString *hash_key = zhregex_ctx->hash_key;
+  const char *prefix = zhregex_ctx->prefix;
+  const char *constraint = zhregex_ctx->constraint;
+  const int regex_match = zhregex_ctx->regex_match;
+  const int inverted = zhregex_ctx->invert;
+  const pcre *regex = zhregex_ctx->regex;
+  int res;
+  long long tmp_index = 0;
+  do {
+    double score;
+    RedisModuleString *relement = RedisModule_ZsetRangeCurrentElement(source_key, &score);
+    const char *element  = RedisModule_StringPtrLen(relement, NULL);
+    char *key_to_check = RedisModule_Alloc(strlen(prefix) + strlen(element) + 1);
+    strcpy(key_to_check, prefix);
+    strcat(key_to_check, element);
+    RedisModuleString *rkey_to_check = RedisModule_CreateString(ctx, key_to_check, strlen(key_to_check));
+    // RedisModule_Free(key_to_check);
+
+    RedisModuleKey *element_key =
+        RedisModule_OpenKey(ctx, rkey_to_check, REDISMODULE_READ);
+    // RedisModule_FreeString(ctx, rkey_to_check);
+
+    if ((RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_HASH) &&
+        (RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_EMPTY)) {
+      struct ZHRegexReply reply;
+      reply.type = 1;
+      reply.string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
+      printf("Exited safely early because of WRONGTYPE error in element_key\n");
+      struct LoopThreadRes return_val = {0, reply};
+      return return_val;
+    }
+
+    if (RedisModule_KeyType(element_key) == REDISMODULE_KEYTYPE_EMPTY) {
+      RedisModule_CloseKey(element_key);
+      printf("Key empty, moving on\n");
+      continue;
+    }
+
+    if (RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_HASH) {
+      RedisModule_CloseKey(element_key);
+      printf("Key not a hash (and not empty), moving on\n");
+      continue;
+    }
+
+    if (RedisModule_StringPtrLen(hash_key, NULL) == NULL) {
+      RedisModule_CloseKey(element_key);
+      printf("Hash key is null\n");
+      continue;
+    }
+
+    RedisModuleString *rhash_value;
+    RedisModule_HashGet(element_key, REDISMODULE_HASH_NONE, hash_key, &rhash_value, NULL);
+    if (rhash_value == NULL) {
+      printf("No value for key\n");
+      RedisModule_CloseKey(element_key);
+      continue;
+    }
+    const char *hash_value = RedisModule_StringPtrLen(rhash_value, NULL);
+    RedisModule_FreeString(ctx, rhash_value);
+
+    if (regex_match) {
+      // 1 is match, -1 is no match, less than -1 is error.
+      res = CheckCompiledRegexOnString(regex, hash_value);
+      if ((res == 1) ^ inverted) {
+        *counter = *counter + 1;
+        RedisModule_ZsetAdd(target_key, score, relement, NULL);
+      }
+      if (res != 1 && res != -1) {
+        printf("Got an error %d with teh regex\n", res);
+      }
+    } else {
+      if ((strcasestr(hash_value, constraint) != NULL) ^ inverted) {
+        *counter = *counter + 1;
+        RedisModule_ZsetAdd(target_key, score, relement, NULL);
+      }
+    }
+
+    RedisModule_FreeString(ctx, relement);
+    RedisModule_CloseKey(element_key);
+
+    if (count != -1 && *counter == count) {
+      printf("Exiting early; reached count\n");
+      struct LoopThreadRes return_val = {1, {}};
+      return return_val;
+    }
+
+    *index = *index + 1;
+    tmp_index = tmp_index + 1;
+  } while (RedisModule_ZsetRangeNext(source_key) != 0 && tmp_index < 200);
+
+  struct LoopThreadRes return_val = {2, {}};
+  return return_val;
+}
+
 /* The thread entry point that actually executes the blocking part
  * of the command HELLO.BLOCK. */
 void *ZHRegex_ThreadMain(void *arg) {
@@ -119,206 +225,77 @@ void *ZHRegex_ThreadMain(void *arg) {
 
     RedisModuleBlockedClient *bc = targ->bc;
     RedisModuleCtx *ctx = targ->ctx;
-    const char *prefix = targ->prefix;
-    const char *constraint = targ->constraint;
-    const int regex_match = targ->regex_match;
-    const int inverted = targ->invert;
-    const pcre *regex = targ->regex;
-    long long count = targ->count;
-    RedisModuleString *hash_key = RedisModule_CreateStringFromString(ctx, targ->hash_key);
     RedisModuleString *source_set = targ->source_set;
     RedisModuleString *target_set = targ->target_set;
 
     struct ZHRegexReply *reply = RedisModule_Alloc(sizeof(struct ZHRegexReply *));
 
-    RedisModule_ThreadSafeContextLock(ctx);
-
-    RedisModuleKey *source_key =
-        RedisModule_OpenKey(ctx, source_set, REDISMODULE_READ);
-
-    if (RedisModule_KeyType(source_key) != REDISMODULE_KEYTYPE_ZSET) {
-      RedisModule_CloseKey(source_key);
-      RedisModule_ThreadSafeContextUnlock(ctx);
-      reply->type = 1;
-      reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
-      RedisModule_UnblockClient(bc, reply);
-      printf("Exited safely early because of WRONGTYPE error in source_key\n");
-      return NULL;
-    }
-
-    RedisModuleKey *target_key =
-        RedisModule_OpenKey(ctx, target_set, REDISMODULE_READ | REDISMODULE_WRITE);
-
-    if ((RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_ZSET) &&
-        (RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_EMPTY)) {
-      RedisModule_CloseKey(source_key);
-      RedisModule_CloseKey(target_key);
-      RedisModule_ThreadSafeContextUnlock(ctx);
-      reply->type = 1;
-      reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
-      RedisModule_UnblockClient(bc, reply);
-      printf("Exited safely early because of WRONGTYPE error in target_key\n");
-      return NULL;
-    }
-
-    RedisModule_ZsetFirstInScoreRange(source_key, REDISMODULE_NEGATIVE_INFINITE, REDISMODULE_POSITIVE_INFINITE, 0, 0);
-
-    long long counter = 0;
-    long long index = 0;
+    long long ncounter = 0;
+    int at_end = 1;
     long long nindex = 0;
-    long long non_existance_counter = 0;
-    int res;
-
+    long long tindex = 0;
+    struct LoopThreadRes lres;
     do {
-      double score;
-      RedisModuleString *relement = RedisModule_ZsetRangeCurrentElement(source_key, &score);
-      const char *element  = RedisModule_StringPtrLen(relement, NULL);
-      char *key_to_check = RedisModule_Alloc(strlen(prefix) + strlen(element) + 1);
-      strcpy(key_to_check, prefix);
-      strcat(key_to_check, element);
 
-      RedisModuleString *rkey_to_check = RedisModule_CreateString(ctx, key_to_check, strlen(key_to_check));
+      struct timespec tim, tim2;
+      tim.tv_sec = 0;
+      tim.tv_nsec = 100;
+      nanosleep(&tim , &tim2);
 
-      RedisModuleKey *element_key =
-          RedisModule_OpenKey(ctx, rkey_to_check, REDISMODULE_READ);
-      RedisModule_FreeString(ctx, rkey_to_check);
-      RedisModule_Free(key_to_check);
+      RedisModule_ThreadSafeContextLock(ctx);
 
-      if ((RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_HASH) &&
-          (RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_EMPTY)) {
+      RedisModuleKey *source_key =
+          RedisModule_OpenKey(ctx, source_set, REDISMODULE_READ);
+
+      if (RedisModule_KeyType(source_key) != REDISMODULE_KEYTYPE_ZSET) {
         RedisModule_CloseKey(source_key);
-        RedisModule_CloseKey(target_key);
-        RedisModule_CloseKey(element_key);
         RedisModule_ThreadSafeContextUnlock(ctx);
         reply->type = 1;
         reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
         RedisModule_UnblockClient(bc, reply);
-        printf("Exited safely early because of WRONGTYPE error in element_key\n");
+        printf("Exited safely early because of WRONGTYPE error in source_key\n");
         return NULL;
       }
 
-      if (RedisModule_KeyType(element_key) == REDISMODULE_KEYTYPE_EMPTY) {
-        RedisModule_CloseKey(element_key);
-        printf("Key empty, moving on\n");
-        continue;
-      }
+      RedisModuleKey *target_key =
+          RedisModule_OpenKey(ctx, target_set, REDISMODULE_READ | REDISMODULE_WRITE);
 
-      if (RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_HASH) {
-        RedisModule_CloseKey(element_key);
-        printf("Key not a hash (and not empty), moving on\n");
-        continue;
-      }
-
-      if (RedisModule_StringPtrLen(hash_key, NULL) == NULL) {
-        RedisModule_CloseKey(element_key);
-        printf("Hash key is null\n");
-        continue;
-      }
-
-      RedisModuleString *rhash_value;
-      RedisModule_HashGet(element_key, REDISMODULE_HASH_NONE, hash_key, &rhash_value, NULL);
-      if (rhash_value == NULL) {
-        printf("No value for key\n");
-        RedisModule_CloseKey(element_key);
-        continue;
-      }
-      const char *hash_value = RedisModule_StringPtrLen(rhash_value, NULL);
-      RedisModule_FreeString(ctx, rhash_value);
-
-      if (regex_match) {
-        // 1 is match, -1 is no match, less than -1 is error.
-        res = CheckCompiledRegexOnString(regex, hash_value);
-        if ((res == 1) ^ inverted) {
-          counter = counter + 1;
-          RedisModule_ZsetAdd(target_key, score, relement, NULL);
-          RedisModule_FreeString(ctx, relement);
-        }
-        if (res != 1 && res != -1) {
-          printf("Got an error %d with teh regex\n", res);
-        }
-      } else {
-        if ((strcasestr(constraint, hash_value) != NULL) ^ inverted) {
-          counter = counter + 1;
-          RedisModule_ZsetAdd(target_key, score, relement, NULL);
-          RedisModule_FreeString(ctx, relement);
-        }
-      }
-
-      RedisModule_CloseKey(element_key);
-
-      if (count != -1 && counter == count) {
-        printf("Exiting early; reached count\n");
-        break;
-      }
-
-      if (index%200 == 0) {
+      if ((RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_ZSET) &&
+          (RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_EMPTY)) {
         RedisModule_CloseKey(source_key);
         RedisModule_CloseKey(target_key);
         RedisModule_ThreadSafeContextUnlock(ctx);
-
-        struct timespec tim, tim2;
-        tim.tv_sec = 0;
-        tim.tv_nsec = 100;
-        nanosleep(&tim , &tim2);
-
-        RedisModule_ThreadSafeContextLock(ctx);
-
-        source_key = RedisModule_OpenKey(ctx, source_set, REDISMODULE_READ);
-
-        if (RedisModule_KeyType(source_key) != REDISMODULE_KEYTYPE_ZSET) {
-          RedisModule_CloseKey(source_key);
-          RedisModule_ThreadSafeContextUnlock(ctx);
-          reply->type = 1;
-          reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
-          RedisModule_UnblockClient(bc, reply);
-          printf("Exited safely early because of WRONGTYPE error in source_key\n");
-          return NULL;
-        }
-
-        target_key = RedisModule_OpenKey(ctx, target_set, REDISMODULE_READ | REDISMODULE_WRITE);
-
-        if ((RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_ZSET) &&
-            (RedisModule_KeyType(target_key) != REDISMODULE_KEYTYPE_EMPTY)) {
-          RedisModule_CloseKey(source_key);
-          RedisModule_CloseKey(target_key);
-          RedisModule_ThreadSafeContextUnlock(ctx);
-          reply->type = 1;
-          reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
-          RedisModule_UnblockClient(bc, reply);
-          printf("Exited safely early because of WRONGTYPE error in target_key\n");
-          return NULL;
-        }
-
-        RedisModule_ZsetFirstInScoreRange(source_key, REDISMODULE_NEGATIVE_INFINITE, REDISMODULE_POSITIVE_INFINITE, 0, 0);
-
-        nindex = 0;
-        do {
-          RedisModule_ZsetRangeNext(source_key);
-          nindex = nindex + 1;
-        } while (nindex < index);
-
-        // double tmp_score;
-        // do {
-        //   RedisModuleString *tmp_relement = RedisModule_ZsetRangeCurrentElement(source_key, &tmp_score);
-        //   const char *tmp_element  = strdup(RedisModule_StringPtrLen(tmp_relement, NULL));
-        //   if (strcmp(tmp_element, element) == 0 && tmp_score == score) {
-        //     break;
-        //   }
-        //   printf("Skipping element..\n");
-        //   RedisModule_ZsetRangeNext(source_key);
-        // } while(1==1);
+        reply->type = 1;
+        reply->string_val = REDISMODULE_ERRORMSG_WRONGTYPE;
+        RedisModule_UnblockClient(bc, reply);
+        printf("Exited safely early because of WRONGTYPE error in target_key\n");
+        return NULL;
       }
 
-      index = index + 1;
-    } while (RedisModule_ZsetRangeNext(source_key) != 0);
+      RedisModule_ZsetFirstInScoreRange(source_key, REDISMODULE_NEGATIVE_INFINITE, REDISMODULE_POSITIVE_INFINITE, 0, 0);
 
-    printf("Didn't exist %lld times\n", non_existance_counter);
+      tindex = 0;
+      do {
+        RedisModule_ZsetRangeNext(source_key);
+        tindex = tindex + 1;
+      } while (tindex < nindex);
 
-    RedisModule_CloseKey(source_key);
-    RedisModule_CloseKey(target_key);
-    RedisModule_ThreadSafeContextUnlock(ctx);
+      lres = ZHRegex_LoopThread(ctx, source_key, target_key, targ, &ncounter, &nindex);
+
+      at_end = RedisModule_ZsetRangeNext(source_key);
+      RedisModule_CloseKey(source_key);
+      RedisModule_CloseKey(target_key);
+      RedisModule_ThreadSafeContextUnlock(ctx);
+
+      if (lres.status == 0) {
+        *reply = lres.reply;
+        RedisModule_UnblockClient(bc,reply);
+        return NULL;
+      }
+    } while (at_end != 0 && lres.status != 1);
+
     reply->type = 2;
-    reply->long_long_val = counter;
+    reply->long_long_val = ncounter;
     RedisModule_UnblockClient(bc,reply);
     return NULL;
 }
@@ -403,8 +380,8 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     pthread_t tid;
     RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx,ZHRegex_Reply,ZHRegex_Timeout,ZHRegex_FreeData,0);
 
-    struct ZHRegexCtx *targ = RedisModule_Alloc(sizeof(struct ZHRegexCtx));
-    struct ZHRegexCtx rarg = (struct ZHRegexCtx) {
+    void *targ = RedisModule_Alloc(sizeof(struct ZHRegexCtx));
+    struct ZHRegexCtx rarg = {
       .ctx = RedisModule_GetThreadSafeContext(bc),
       .bc = bc,
       .source_set = source_set,
@@ -419,9 +396,9 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     };
     memcpy(targ, &rarg, sizeof(struct ZHRegexCtx));
 
-    // void RedisModule_SetDisconnectCallback(RedisModuleBlockedClient *bc, RedisModuleDisconnectFunc callback);
+    RedisModule_SetDisconnectCallback(bc, ZHRegex_DisconnectCallback);
 
-    if (pthread_create(&tid,NULL,ZHRegex_ThreadMain,(void*)targ) != 0) {
+    if (pthread_create(&tid,NULL,ZHRegex_ThreadMain,targ) != 0) {
         RedisModule_AbortBlock(bc);
         return RedisModule_ReplyWithError(ctx,"-ERR Can't start thread");
     }

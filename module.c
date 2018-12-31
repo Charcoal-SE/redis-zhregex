@@ -140,11 +140,11 @@ struct LoopThreadRes ZHRegex_LoopThread(RedisModuleCtx *ctx, RedisModuleKey *sou
     strcpy(key_to_check, prefix);
     strcat(key_to_check, element);
     RedisModuleString *rkey_to_check = RedisModule_CreateString(ctx, key_to_check, strlen(key_to_check));
-    // RedisModule_Free(key_to_check);
 
     RedisModuleKey *element_key =
         RedisModule_OpenKey(ctx, rkey_to_check, REDISMODULE_READ);
-    // RedisModule_FreeString(ctx, rkey_to_check);
+    RedisModule_Free(key_to_check);
+    RedisModule_FreeString(ctx, rkey_to_check);
 
     if ((RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_HASH) &&
         (RedisModule_KeyType(element_key) != REDISMODULE_KEYTYPE_EMPTY)) {
@@ -224,7 +224,9 @@ void *ZHRegex_ThreadMain(void *arg) {
     struct ZHRegexCtx *targ = arg;
 
     RedisModuleBlockedClient *bc = targ->bc;
-    RedisModuleCtx *ctx = targ->ctx;
+    RedisModuleCtx *main_ctx = targ->ctx;
+    RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
+    RedisModule_AutoMemory(ctx);
     RedisModuleString *source_set = targ->source_set;
     RedisModuleString *target_set = targ->target_set;
 
@@ -297,6 +299,11 @@ void *ZHRegex_ThreadMain(void *arg) {
     reply->type = 2;
     reply->long_long_val = ncounter;
     RedisModule_UnblockClient(bc,reply);
+    pcre_free((pcre*)targ->regex);
+    RedisModule_Free((char*)targ->prefix);
+    RedisModule_Free((char*)targ->constraint);
+    RedisModule_FreeThreadSafeContext(ctx);
+    RedisModule_Free(arg);
     return NULL;
 }
 
@@ -382,7 +389,7 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
 
     void *targ = RedisModule_Alloc(sizeof(struct ZHRegexCtx));
     struct ZHRegexCtx rarg = {
-      .ctx = RedisModule_GetThreadSafeContext(bc),
+      .ctx = ctx,
       .bc = bc,
       .source_set = source_set,
       .target_set = target_set,

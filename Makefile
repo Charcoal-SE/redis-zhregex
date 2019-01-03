@@ -1,8 +1,9 @@
 SHOBJ_CFLAGS ?= -fno-common -g -ggdb
 SHOBJ_LDFLAGS ?= -shared -Bsymbolic
-GCCFLAGS = -Wall -Wextra -g -fPIC -lc -lm -Og -std=gnu99 -I.
+LDFLAGS = -lc -lpcre
+GCCFLAGS = -Wall -Wextra -g -fPIC -shared -lc -lm -Og -std=gnu99 -I.
 DISABLED_WARNINGS =  -Wno-unused-parameter
-CLANGFLAGS = -g -fPIC -std=gnu99 -I. -Wall -Wextra $(DISABLED_WARNINGS)
+CLANGFLAGS = -g -fPIC -shared -std=gnu99 -I. -Wall -Wextra $(DISABLED_WARNINGS)
 CC=clang
 
 ifeq ($(CC),clang)
@@ -13,8 +14,8 @@ endif
 
 all: module.so
 
-module.so: module.o
-	$(LD) -o $@ module.o $(SHOBJ_LDFLAGS) $(LIBS) -lc -lpcre
+module.so:
+	$(CC) -o $@ module.c $(CFLAGS) $(LDFLAGS)
 
 clean:
 	rm -f *.xo *.so *.o

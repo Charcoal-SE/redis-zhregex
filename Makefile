@@ -12,9 +12,9 @@ else ifeq ($(CC),gcc)
 	CFLAGS = $(GCCFLAGS)
 endif
 
-all: module.so
+# all: module
 
-module.so:
+module.so: module.c
 	$(CC) -o $@ module.c $(CFLAGS) $(LDFLAGS)
 
 clean:

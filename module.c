@@ -85,6 +85,7 @@ struct ZHRegexReply {
   int type;
   char *string_val;
   long long long_long_val;
+  struct ZHRegexCtx* zhregex_ctx;
 };
 
 int ZHRegex_Reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
@@ -92,11 +93,15 @@ int ZHRegex_Reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argc);
     printf("Replying\n");
     struct ZHRegexReply *reply = RedisModule_GetBlockedClientPrivateData(ctx);
+    printf("Got data\n");
     if (reply->type == 1) {
+      printf("Error\n");
       return RedisModule_ReplyWithError(ctx,reply->string_val);
     } else if (reply->type == 2) {
+      printf("Num\n");
       return RedisModule_ReplyWithLongLong(ctx,reply->long_long_val);
     } else {
+      printf("Error\n");
       return RedisModule_ReplyWithError(ctx, "Invalid reply type");
     }
 }
@@ -109,8 +114,17 @@ int ZHRegex_Timeout(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 }
 
 void ZHRegex_FreeData(RedisModuleCtx *ctx, void *privdata) {
-    // RedisModule_Free(privdata);
-    // I shouldn't not free stuff... but eh, redis's automagical stuff should get it.
+  struct ZHRegexReply* reply = privdata;
+  struct ZHRegexCtx* targ = reply->zhregex_ctx;
+  pcre_free((pcre*)targ->regex);
+  RedisModule_Free((char*)targ->prefix);
+  RedisModule_Free((char*)targ->constraint);
+  // RedisModule_FreeString(ctx, targ->source_set);
+  // RedisModule_FreeString(ctx, targ->target_set);
+  // RedisModule_FreeString(ctx, targ->hash_key);
+  RedisModule_Free(targ);
+  RedisModule_Free(reply);
+  printf("Freed!\n");
 }
 
 void ZHRegex_DisconnectCallback(RedisModuleCtx *ctx, RedisModuleBlockedClient *bc) {
@@ -230,12 +244,14 @@ void *ZHRegex_ThreadMain(void *arg) {
     RedisModuleString *source_set = targ->source_set;
     RedisModuleString *target_set = targ->target_set;
 
-    struct ZHRegexReply *reply = RedisModule_Alloc(sizeof(struct ZHRegexReply *));
+    struct ZHRegexReply *reply = RedisModule_Alloc(sizeof(struct ZHRegexReply));
+    reply->zhregex_ctx = targ;
 
     long long ncounter = 0;
     int at_end = 1;
     long long nindex = 0;
     long long tindex = 0;
+    printf("Starting main loop\n");
     struct LoopThreadRes lres;
     do {
 
@@ -295,15 +311,13 @@ void *ZHRegex_ThreadMain(void *arg) {
         return NULL;
       }
     } while (at_end != 0 && lres.status != 1);
+    printf("Finished main loop\n");
 
     reply->type = 2;
     reply->long_long_val = ncounter;
-    RedisModule_UnblockClient(bc,reply);
-    pcre_free((pcre*)targ->regex);
-    RedisModule_Free((char*)targ->prefix);
-    RedisModule_Free((char*)targ->constraint);
     RedisModule_FreeThreadSafeContext(ctx);
-    RedisModule_Free(arg);
+    RedisModule_UnblockClient(bc,reply);
+    printf("Finished main loop for real!\n");
     return NULL;
 }
 
@@ -330,11 +344,9 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
       arg_count = arg_count + 2;
       if (RMUtil_ParseArgsAfter("COUNT", argv, argc, "l", &count) != REDISMODULE_OK) {
         const char *offending_parameter = RedisModule_StringPtrLen(argv[count_offset+1], NULL);
-        char *buf;
-        size_t sz;
-        sz = snprintf(NULL, 0, "ERR Invalid paramter '%s' passed for COUNT", offending_parameter);
-        buf = (char *)RedisModule_Alloc(sz + 1); /* make sure you check for != NULL in real code */
-        snprintf(buf, sz+1, "ERR Invalid paramter '%s' passed for COUNT", offending_parameter);
+        size_t sz = snprintf(NULL, 0, "ERR Invalid paramter '%s' passed for COUNT", offending_parameter);
+        char *buf = (char *)RedisModule_Alloc(sz + 1);
+        snprintf(buf, sz+1, "ERR Invalid paramter '%s' passed for COUNT", offending_parameter); // You should check for error conditions
         return RedisModule_ReplyWithError(ctx, buf);
       }
       printf("Found count in args, set to %lld\n", count);
@@ -351,22 +363,20 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
 
     size_t prefix_len;
     const char *prefix_raw     = RedisModule_StringPtrLen(argv[3], &prefix_len);
-    char *prefix;
-    prefix = RedisModule_Alloc(sizeof(char) * (prefix_len + 1));
+    char *prefix = RedisModule_Alloc(sizeof(char) * (prefix_len + 1));
     strcpy(prefix,prefix_raw);
 
     RedisModuleString *hash_key = argv[4];
 
     size_t constraint_len;
     const char *constraint_raw  = RedisModule_StringPtrLen(argv[5], &constraint_len);
-    char *constraint;
-    constraint = RedisModule_Alloc(sizeof(char) * (constraint_len + 1));
+    char *constraint = RedisModule_Alloc(sizeof(char) * (constraint_len + 1));
     strcpy(constraint,constraint_raw);
 
     pcre *regex = NULL;
     if (regex_match) {
       printf("Compiling regex %s\n", constraint);
-      char *errmsg;
+      char *errmsg = NULL;
       regex = SimpleCompileRegex(constraint, &errmsg);
 
       printf("Compiled regex\n");
@@ -377,6 +387,7 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
         RedisModule_Free(errmsg);
         return REDISMODULE_ERR;
       }
+      RedisModule_Free(errmsg);
 
       printf("Regex compilation sucessful\n");
     }
@@ -403,7 +414,7 @@ int ZHRegex_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     };
     memcpy(targ, &rarg, sizeof(struct ZHRegexCtx));
 
-    RedisModule_SetDisconnectCallback(bc, ZHRegex_DisconnectCallback);
+    // RedisModule_SetDisconnectCallback(bc, ZHRegex_DisconnectCallback);
 
     if (pthread_create(&tid,NULL,ZHRegex_ThreadMain,targ) != 0) {
         RedisModule_AbortBlock(bc);

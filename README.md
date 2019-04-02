@@ -2,7 +2,7 @@
 
 To compile the code, you'll need to clone two repositories into this directory.
 
-    git clone https://github.com/RedisLabs/RedisModuleSDK
+    git clone https://github.com/RedisLabs/RedisModulesSDK
     git clone https://github.com/antirez/redis
     
 And symlink files in:
